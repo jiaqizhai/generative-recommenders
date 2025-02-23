@@ -16,11 +16,10 @@
 
 # pyre-strict
 
-import dataclasses
-
-from dataclasses import dataclass
+import abc
+import copy
 from enum import Enum, unique
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple
 
 import torch
 
@@ -31,33 +30,15 @@ import triton
 from triton.runtime.autotuner import Autotuner
 
 try:
-    from hammer.ops.triton.utils import (
-        NamedSpecType,
-        register_tritoncc_specs,
-        SpecType,
-        triton_autotune,
-        VersionedSpec,
-    )
-    from hammer.utils import HammerKernel, is_dev_mode, set_dev_mode, set_verbose_level
+    torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:sparse_ops")
+    torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:sparse_ops_cpu")
+except OSError:
+    pass
+
+try:
+    from hammer.ops.triton.utils import triton_autotune
+    from hammer.utils import is_dev_mode, set_dev_mode, set_verbose_level
 except ImportError:
-    SpecType = Union[Tuple[str, int], Tuple[str, int, bool], int, str]
-    NamedSpecType = Dict[str, SpecType]
-
-    @dataclass
-    class VersionedSpec:
-        """
-        spec: a dict that maps each argument name to a spec
-        version: the version of the spec
-        """
-
-        spec: NamedSpecType = dataclasses.field(default_factory=dict)
-        version: str = ""
-        default_values: Dict[str, Any] = dataclasses.field(default_factory=dict)
-
-    # pyre-ignore[2,3]
-    def register_tritoncc_specs(func, versioned_specs):
-        return func
-
     # pyre-ignore
     def triton_autotune(
         configs: List[triton.Config],
@@ -108,44 +89,39 @@ except ImportError:
         global VERBOSE_LEVEL
         return VERBOSE_LEVEL
 
-    @unique
-    class HammerKernel(Enum):
-        TRITON = "TRITON"
-        PYTORCH = "PYTORCH"
-        CUDA = "CUDA"
-        TRITON_CC = "TRITON_CC"
+
+@unique
+class HammerKernel(Enum):
+    TRITON = "TRITON"
+    PYTORCH = "PYTORCH"
+    CUDA = "CUDA"
+    TRITON_CC = "TRITON_CC"
 
 
-class GRModuleBase(torch.nn.Module):
+class HammerModule(torch.nn.Module, abc.ABC):
     _is_inference: bool
     _use_triton_cc: bool
-    _custom_kernel: bool
     _hammer_kernel: Optional[HammerKernel] = None
 
     def __init__(
         self,
         is_inference: bool,
-        use_triton_cc: bool = True,
-        custom_kernel: bool = True,
+        use_triton_cc: bool = False,
         hammer_kernel: Optional[HammerKernel] = None,
     ) -> None:
         super().__init__()
         self._is_inference = is_inference
-        self._use_triton_cc = use_triton_cc
-        self._custom_kernel = custom_kernel
         self._hammer_kernel = hammer_kernel
+        self._use_triton_cc = use_triton_cc
 
     def hammer_kernel(self) -> HammerKernel:
         kernel = self._hammer_kernel
         if kernel is not None:
             return kernel
-        if self._custom_kernel:
-            if self._is_inference and self._use_triton_cc:
-                return HammerKernel.TRITON_CC
-            else:
-                return HammerKernel.TRITON
+        if self._is_inference and self._use_triton_cc:
+            return HammerKernel.TRITON_CC
         else:
-            return HammerKernel.PYTORCH
+            return HammerKernel.TRITON
 
     # pyre-ignore[2]
     def recursive_setattr(self, name: str, value: Any) -> None:
@@ -154,15 +130,15 @@ class GRModuleBase(torch.nn.Module):
                 setattr(module, name, value)
 
     @property
-    def predict_mode(self) -> bool:
+    def is_inference(self) -> bool:
         return self._is_inference
 
     @property
-    def eval_mode(self) -> bool:
+    def is_eval(self) -> bool:
         return (not self._is_inference) and (not self.training)
 
     @property
-    def train_mode(self) -> bool:
+    def is_train(self) -> bool:
         return (not self._is_inference) and self.training
 
 
@@ -256,20 +232,14 @@ def prev_power_of_2(x: int) -> int:
         return out // 2 if out > x else out
 
 
-STATIC_MAX_SEQ_LEN = -1
-L2_STATIC_MAX_SEQ_LEN = -1
-USE_RUNTIME_MAX_SEQ_LEN = True
+STATIC_MAX_SEQ_LENS: List[int] = []
+USE_RUNTIME_MAX_SEQ_LEN: bool = True
 
 
-def set_static_max_seq_lens(max_seq_len: int, l2_max_seq_len: int) -> None:
-    global STATIC_MAX_SEQ_LEN
-    global L2_STATIC_MAX_SEQ_LEN
-    STATIC_MAX_SEQ_LEN = max_seq_len
-    L2_STATIC_MAX_SEQ_LEN = l2_max_seq_len
-
-
-def get_static_max_seq_lens() -> Tuple[int, int]:
-    return STATIC_MAX_SEQ_LEN, L2_STATIC_MAX_SEQ_LEN
+def set_static_max_seq_lens(max_seq_lens: List[int]) -> None:
+    global STATIC_MAX_SEQ_LENS
+    STATIC_MAX_SEQ_LENS = copy.deepcopy(max_seq_lens)
+    STATIC_MAX_SEQ_LENS.sort()
 
 
 def set_use_runtime_max_seq_len(use_runtime_max_seq_len: bool) -> None:
@@ -277,16 +247,89 @@ def set_use_runtime_max_seq_len(use_runtime_max_seq_len: bool) -> None:
     USE_RUNTIME_MAX_SEQ_LEN = use_runtime_max_seq_len
 
 
-def use_runtime_max_seq_len() -> bool:
-    return USE_RUNTIME_MAX_SEQ_LEN
-
-
 def autotune_max_seq_len(runtime_max_seq_len: int) -> int:
-    if use_runtime_max_seq_len():
+    global USE_RUNTIME_MAX_SEQ_LEN
+
+    if USE_RUNTIME_MAX_SEQ_LEN:
         return prev_power_of_2(runtime_max_seq_len)
     else:
-        max_seq_len, l2_max_seq_len = get_static_max_seq_lens()
-        assert (
-            max_seq_len > 0 and l2_max_seq_len > 0
-        ), "max_seq_len and l2_max_seq_len must be greater than 0"
-        return l2_max_seq_len if runtime_max_seq_len <= l2_max_seq_len else max_seq_len
+        for max_len in STATIC_MAX_SEQ_LENS:
+            if max_len >= runtime_max_seq_len:
+                return max_len
+        return STATIC_MAX_SEQ_LENS[-1]
+
+
+@torch.fx.wrap
+def fx_unwrap_optional_tensor(optional: Optional[torch.Tensor]) -> torch.Tensor:
+    assert optional is not None, "Expected optional to be non-None Tensor"
+    return optional
+
+
+@torch.fx.wrap
+def fx_arange(len: int, device: torch.device) -> torch.Tensor:
+    return torch.arange(len, device=device)
+
+
+@torch.fx.wrap
+def fx_infer_max_len(
+    lengths: torch.Tensor,
+) -> int:
+    max_len = int(lengths.max().item())
+    if not torch.jit.is_scripting() and torch.compiler.is_compiling():
+        # Tell Dynamo this data-dependent value is in the range [0, 10**9)
+        torch._check_is_size(max_len)
+        torch._check(max_len < 10**9)
+        torch._check(max_len > 0)
+    return max_len
+
+
+@torch.fx.wrap
+def fx_mark_length_features(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor
+
+
+@torch.fx.wrap
+def fx_torch_ones(
+    shape: List[int],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    return torch.ones(shape, device=device, dtype=dtype)
+
+
+@torch.fx.wrap
+def fx_torch_zeros(shape: List[int], device: torch.device) -> torch.Tensor:
+    return torch.zeros(shape, device=device)
+
+
+@torch.fx.wrap
+def jagged_to_padded_dense(
+    values: torch.Tensor,
+    offsets: List[torch.Tensor],
+    max_lengths: List[int],
+    padding_value: float,
+) -> torch.Tensor:
+    return torch.ops.fbgemm.jagged_to_padded_dense(
+        values=values,
+        offsets=offsets,
+        max_lengths=max_lengths,
+        padding_value=padding_value,
+    )
+
+
+@torch.fx.wrap
+def dense_to_jagged(
+    dense: torch.Tensor,
+    x_offsets: List[torch.Tensor],
+) -> torch.Tensor:
+    return torch.ops.fbgemm.dense_to_jagged(
+        dense=dense,
+        x_offsets=x_offsets,
+    )[0]
+
+
+def init_mlp_weights_optional_bias(m: torch.nn.Module) -> None:
+    if isinstance(m, torch.nn.Linear):
+        torch.nn.init.xavier_uniform_(m.weight)
+        if m.bias is not None:
+            m.bias.data.fill_(0.0)
